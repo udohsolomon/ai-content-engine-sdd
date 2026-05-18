@@ -1,0 +1,902 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AI Content-Production Engine — System Design Document</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --rule: #d8d8d8;
+    --accent: #b34700;
+    --bg: #fafafa;
+    --code-bg: #f1efe9;
+  }
+  html { background: var(--bg); }
+  body {
+    color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    max-width: 880px;
+    margin: 36px auto;
+    padding: 0 28px 80px;
+  }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 19px;
+    margin: 38px 0 10px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--rule);
+    letter-spacing: -0.01em;
+  }
+  h3 { font-size: 15.5px; margin: 22px 0 6px; }
+  h4 { font-size: 14px; margin: 16px 0 4px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  p, ul, ol { margin: 8px 0; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 3px 0; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  pre {
+    background: var(--code-bg);
+    padding: 12px 14px;
+    border-radius: 4px;
+    overflow-x: auto;
+    line-height: 1.45;
+    border-left: 3px solid var(--accent);
+  }
+  pre code { background: none; padding: 0; }
+  .meta { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  .tldr {
+    background: #fff;
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px;
+    margin: 18px 0 26px;
+    border-radius: 3px;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--rule); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0ede4; font-weight: 600; }
+  .toc { font-size: 13.5px; columns: 2; column-gap: 36px; margin: 14px 0 6px; }
+  .toc a { color: var(--fg); text-decoration: none; border-bottom: 1px dotted var(--rule); }
+  .toc a:hover { color: var(--accent); }
+  .note { color: var(--muted); font-style: italic; }
+  .tag {
+    display: inline-block;
+    font-size: 11px;
+    padding: 1px 6px;
+    background: #ede9d8;
+    border-radius: 3px;
+    margin-right: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6a4c00;
+  }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 32px 0; }
+  .ascii {
+    background: var(--code-bg);
+    padding: 14px;
+    border-radius: 4px;
+    white-space: pre;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.4;
+  }
+  .diagram {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin: 14px 0;
+    border-radius: 6px;
+    box-shadow: 0 1px 0 #e2e8f0;
+    overflow: hidden;
+  }
+</style>
+</head>
+<body>
+
+<h1>AI Content-Production Engine — System Design</h1>
+<div class="meta">Engineer-to-engineer notes for the in-flight brand-identity-preserving short-form video regenerator. Stack: Next.js / Postgres / Drizzle, Cloudflare R2, Apify intake, WaveSpeed image (Nano Banana Pro → Flux Kontext Max → Seedream v4.5), WaveSpeed + Kling v3 Standard motion, ffmpeg, worker queue.</div>
+
+<div class="tldr">
+<strong>Scope.</strong> Concrete failure modes the live system hits first under real volume (a few hundred clips/day × multiple brands × three image providers × motion), the state machine and persisted state needed to make batches resumable and operator-driven, the async webhook/polling reconciliation model, prompt &amp; identity versioning, drift detection, observability, security, and a phased rollout. Three sharp questions at the end. No generic LLM theory.
+</div>
+
+<h4>Contents</h4>
+<div class="toc">
+<a href="#arch">1. Architecture &amp; queue topology</a><br>
+<a href="#data">2. Data model</a><br>
+<a href="#failures">3. Failure modes under real volume</a><br>
+<a href="#batch">4. Batch controls</a><br>
+<a href="#async">5. Async jobs: webhooks, polling, reconciliation</a><br>
+<a href="#prompts">6. Prompt versioning</a><br>
+<a href="#identity">7. Brand-identity preservation</a><br>
+<a href="#drift">8. Silent drift detection</a><br>
+<a href="#obs">9. Observability</a><br>
+<a href="#sec">10. Security &amp; governance</a><br>
+<a href="#rollout">11. Rollout plan</a><br>
+<a href="#qs">12. Three questions</a>
+</div>
+
+<hr>
+
+<h2 id="arch">1. Architecture &amp; queue topology</h2>
+
+<p>Pipeline is staged, not monolithic. Each stage is its own queue with its own concurrency, retry policy, and DLQ. This matters because the stages have wildly different latency profiles and failure shapes — coupling them into one queue makes the slowest stage block the fastest, and turns every retry into a re-run of the whole chain.</p>
+
+<svg class="diagram" viewBox="0 0 820 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture: stage-per-queue pipeline">
+  <defs>
+    <style>
+      .a-bg{fill:#f8fafc}
+      .a-card{fill:#fff;stroke:#dbe5ee;stroke-width:1.4}
+      .a-lane{fill:#effafa;stroke:#9dd5d6;stroke-width:1.4}
+      .a-store{fill:#f1f5f9;stroke:#cbd5e1;stroke-width:1.4}
+      .a-warn{fill:#fff7ed;stroke:#fed7aa;stroke-width:1.4}
+      .a-h{font:700 12px Inter,Arial,sans-serif;fill:#0f172a}
+      .a-t{font:500 10.5px Inter,Arial,sans-serif;fill:#475569}
+      .a-sec{font:600 10px Inter,Arial,sans-serif;fill:#64748b;letter-spacing:0.06em;text-transform:uppercase}
+      .a-num{font:800 10px Inter,Arial,sans-serif;fill:#fff}
+      .a-teal{fill:#4dbab9}
+      .a-line{stroke:#4dbab9;stroke-width:1.8;fill:none;marker-end:url(#aArrT)}
+      .a-dash{stroke:#94a3b8;stroke-width:1.3;stroke-dasharray:4 4;fill:none;marker-end:url(#aArrG)}
+    </style>
+    <marker id="aArrT" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#4dbab9"/></marker>
+    <marker id="aArrG" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#94a3b8"/></marker>
+    <filter id="aSh" x="-8%" y="-8%" width="116%" height="125%"><feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#0f172a" flood-opacity="0.06"/></filter>
+  </defs>
+  <rect class="a-bg" width="820" height="480"/>
+
+  <text x="14" y="22" class="a-sec">1 · Intake &amp; Selection</text>
+  <line x1="14" y1="30" x2="806" y2="30" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="2 3"/>
+
+  <rect x="14" y="40" width="145" height="82" rx="9" class="a-card" filter="url(#aSh)"/>
+  <circle cx="32" cy="60" r="9" class="a-teal"/><text x="28" y="64" class="a-num">1</text>
+  <text x="48" y="64" class="a-h">Sources</text>
+  <text x="28" y="84" class="a-t">Approved accounts</text>
+  <text x="28" y="100" class="a-t">Per-brand allow-list</text>
+
+  <rect x="175" y="40" width="145" height="82" rx="9" class="a-card" filter="url(#aSh)"/>
+  <circle cx="193" cy="60" r="9" class="a-teal"/><text x="189" y="64" class="a-num">2</text>
+  <text x="209" y="64" class="a-h">Apify Intake</text>
+  <text x="189" y="84" class="a-t">Actor runs · cron</text>
+  <text x="189" y="100" class="a-t">Copy-on-pull</text>
+
+  <rect x="336" y="40" width="145" height="82" rx="9" class="a-store" filter="url(#aSh)"/>
+  <circle cx="354" cy="60" r="9" class="a-teal"/><text x="350" y="64" class="a-num">3</text>
+  <text x="370" y="64" class="a-h">R2 Source</text>
+  <text x="350" y="84" class="a-t">Content-addressed</text>
+  <text x="350" y="100" class="a-t">sha256 · immutable</text>
+
+  <rect x="497" y="40" width="145" height="82" rx="9" class="a-card" filter="url(#aSh)"/>
+  <circle cx="515" cy="60" r="9" class="a-teal"/><text x="511" y="64" class="a-num">4</text>
+  <text x="531" y="64" class="a-h">Operator Console</text>
+  <text x="511" y="84" class="a-t">Preview &amp; select</text>
+  <text x="511" y="100" class="a-t">Pool × brand matrix</text>
+
+  <rect x="658" y="40" width="148" height="82" rx="9" class="a-lane" filter="url(#aSh)"/>
+  <circle cx="676" cy="60" r="9" class="a-teal"/><text x="672" y="64" class="a-num">5</text>
+  <text x="692" y="64" class="a-h">Batch Planner</text>
+  <text x="672" y="84" class="a-t">Pin prompt + identity</text>
+  <text x="672" y="100" class="a-t">Pre-flight cost cap</text>
+
+  <line x1="159" y1="80" x2="175" y2="80" class="a-line"/>
+  <line x1="320" y1="80" x2="336" y2="80" class="a-line"/>
+  <line x1="481" y1="80" x2="497" y2="80" class="a-line"/>
+  <line x1="642" y1="80" x2="658" y2="80" class="a-line"/>
+
+  <text x="14" y="156" class="a-sec">2 · Worker Pipeline · stage queues · per-provider concurrency</text>
+  <line x1="14" y1="164" x2="806" y2="164" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="2 3"/>
+
+  <rect x="14" y="174" width="130" height="104" rx="9" class="a-lane" filter="url(#aSh)"/>
+  <text x="28" y="194" class="a-h">Worker Queues</text>
+  <text x="28" y="212" class="a-t">graphile-worker</text>
+  <text x="28" y="226" class="a-t">Pool per stage</text>
+  <text x="28" y="240" class="a-t">DLQ per stage</text>
+  <text x="28" y="254" class="a-t">Per-provider sem.</text>
+  <text x="28" y="268" class="a-t">Idempotency keys</text>
+
+  <rect x="160" y="174" width="124" height="104" rx="9" class="a-card" filter="url(#aSh)"/>
+  <text x="172" y="194" class="a-h">intake</text>
+  <text x="172" y="214" class="a-t">Apify → R2</text>
+  <text x="172" y="230" class="a-t">checksum</text>
+  <text x="172" y="254" class="a-t" font-style="italic" fill="#94a3b8">copy-on-pull</text>
+
+  <rect x="296" y="174" width="124" height="104" rx="9" class="a-card" filter="url(#aSh)"/>
+  <text x="308" y="194" class="a-h">anchor</text>
+  <text x="308" y="214" class="a-t">ffmpeg (pinned)</text>
+  <text x="308" y="230" class="a-t">score frames 0–15</text>
+  <text x="308" y="254" class="a-t" font-style="italic" fill="#94a3b8">picks best frame</text>
+
+  <rect x="432" y="174" width="124" height="104" rx="9" class="a-card" filter="url(#aSh)"/>
+  <text x="444" y="194" class="a-h">image_gen</text>
+  <text x="444" y="214" class="a-t">WaveSpeed</text>
+  <text x="444" y="230" class="a-t">NBP → Flux → SD</text>
+  <text x="444" y="254" class="a-t" font-style="italic" fill="#94a3b8">+ ArcFace eval</text>
+
+  <rect x="568" y="174" width="124" height="104" rx="9" class="a-card" filter="url(#aSh)"/>
+  <text x="580" y="194" class="a-h">motion</text>
+  <text x="580" y="214" class="a-t">WS / Kling v3</text>
+  <text x="580" y="230" class="a-t">async + webhook</text>
+  <text x="580" y="254" class="a-t" font-style="italic" fill="#94a3b8">long-TTL signed</text>
+
+  <rect x="704" y="174" width="102" height="104" rx="9" class="a-card" filter="url(#aSh)"/>
+  <text x="716" y="194" class="a-h">finalize</text>
+  <text x="716" y="214" class="a-t">persist R2 key</text>
+  <text x="716" y="230" class="a-t">mark done</text>
+  <text x="716" y="254" class="a-t" font-style="italic" fill="#94a3b8">cost_spent</text>
+
+  <line x1="144" y1="226" x2="160" y2="226" class="a-line"/>
+  <line x1="284" y1="226" x2="296" y2="226" class="a-line"/>
+  <line x1="420" y1="226" x2="432" y2="226" class="a-line"/>
+  <line x1="556" y1="226" x2="568" y2="226" class="a-line"/>
+  <line x1="692" y1="226" x2="704" y2="226" class="a-line"/>
+
+  <text x="14" y="306" class="a-sec">3 · Control Plane · Async Coordination · Storage · Observability</text>
+  <line x1="14" y1="314" x2="806" y2="314" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="2 3"/>
+
+  <rect x="14" y="324" width="192" height="140" rx="9" class="a-store" filter="url(#aSh)"/>
+  <text x="28" y="344" class="a-h">Postgres Control Plane</text>
+  <text x="28" y="364" class="a-t">batch · batch_item</text>
+  <text x="28" y="380" class="a-t">batch_item_attempt</text>
+  <text x="28" y="396" class="a-t">prompt_version</text>
+  <text x="28" y="412" class="a-t">identity_version</text>
+  <text x="28" y="428" class="a-t">provider_event_inbox</text>
+  <text x="28" y="444" class="a-t">operator_action</text>
+  <text x="28" y="458" class="a-t" font-style="italic" fill="#94a3b8">append-only attempts</text>
+
+  <rect x="216" y="324" width="192" height="140" rx="9" class="a-store" filter="url(#aSh)"/>
+  <text x="230" y="344" class="a-h">R2 Object Storage</text>
+  <text x="230" y="364" class="a-t">Source clips (immutable)</text>
+  <text x="230" y="380" class="a-t">Anchor frames</text>
+  <text x="230" y="396" class="a-t">Regenerated frames</text>
+  <text x="230" y="412" class="a-t">Motion outputs</text>
+  <text x="230" y="428" class="a-t">Identity refs (encrypted)</text>
+  <text x="230" y="458" class="a-t" font-style="italic" fill="#94a3b8">content-addressed keys</text>
+
+  <rect x="418" y="324" width="192" height="140" rx="9" class="a-card" filter="url(#aSh)"/>
+  <text x="432" y="344" class="a-h">Async Coordination</text>
+  <text x="432" y="364" class="a-t">Webhook receiver</text>
+  <text x="432" y="380" class="a-t">HMAC verify · dedupe</text>
+  <text x="432" y="396" class="a-t">Inbox consumer</text>
+  <text x="442" y="410" class="a-t">(SKIP LOCKED)</text>
+  <text x="432" y="426" class="a-t">Reconciler cron · 30–60s</text>
+  <text x="432" y="442" class="a-t">Polls open job_ids</text>
+  <text x="432" y="458" class="a-t" font-style="italic" fill="#94a3b8">webhook fast / poll truth</text>
+
+  <rect x="620" y="324" width="186" height="140" rx="9" class="a-warn" filter="url(#aSh)"/>
+  <text x="634" y="344" class="a-h">Observability &amp; Security</text>
+  <text x="634" y="364" class="a-t">Queue depth + age</text>
+  <text x="634" y="380" class="a-t">Per-provider error rate</text>
+  <text x="634" y="396" class="a-t">Identity score trend</text>
+  <text x="634" y="412" class="a-t">Credit balance</text>
+  <text x="634" y="428" class="a-t">Webhook lag</text>
+  <text x="634" y="444" class="a-t">Per-brand provider ACL</text>
+  <text x="634" y="458" class="a-t" font-style="italic" fill="#94a3b8">alerts on drift &amp; spend</text>
+
+  <line x1="76" y1="278" x2="76" y2="324" class="a-dash"/>
+  <line x1="312" y1="278" x2="312" y2="324" class="a-dash"/>
+  <line x1="494" y1="278" x2="494" y2="324" class="a-dash"/>
+  <line x1="712" y1="278" x2="712" y2="324" class="a-dash"/>
+</svg>
+
+<h3>Components</h3>
+<ul>
+  <li><strong>Next.js app.</strong> Operator UI + API + webhook endpoints. Stateless. Never runs the heavy work itself.</li>
+  <li><strong>Workers.</strong> Separate Node processes pulling from PG-backed queues (pgmq / graphile-worker / River-style). One worker pool per stage so concurrency is tuned independently.</li>
+  <li><strong>Webhook receiver.</strong> Thin HTTP handler whose only job is HMAC-verify the signature and write the event to <code>provider_event_inbox</code>. No business logic in the receiver. See §5.</li>
+  <li><strong>Reconciler.</strong> Cron job (every 30–60s) that scans for jobs in non-terminal states older than <code>max(webhook_grace, polling_floor)</code> and polls the provider directly. Webhook is fast-path, reconciler is the source of truth.</li>
+  <li><strong>R2.</strong> Content-addressable storage: keys are SHA256 of input hash + prompt hash + identity hash. Idempotent retries reuse outputs instead of regenerating.</li>
+</ul>
+
+<h3>Why split intake from selection</h3>
+<p>The brief implies Apify pulls happen up front, operator selects later. <strong>The copy-to-R2 must happen at pull time, not at batch time.</strong> If the worker fetches from Apify (or the upstream URL) at batch start, source decay between selection and processing becomes a hard problem — see §3.3. Treat Apify as a one-shot ingestion: pull, hash, store, never look back.</p>
+
+<h2 id="data">2. Data model</h2>
+
+<svg class="diagram" viewBox="0 0 820 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Data model: entity relationships">
+  <defs>
+    <style>
+      .d-bg{fill:#f8fafc}
+      .d-tbl{fill:#fff;stroke:#dbe5ee;stroke-width:1.4}
+      .d-tblImm{fill:#fff;stroke:#a7f3d0;stroke-width:1.4}
+      .d-tblInb{fill:#fff;stroke:#9dd5d6;stroke-width:1.4}
+      .d-tblAud{fill:#fff;stroke:#fed7aa;stroke-width:1.4}
+      .d-hdr{fill:#0f172a}
+      .d-hdrImm{fill:#065f46}
+      .d-hdrInb{fill:#0e7490}
+      .d-hdrAud{fill:#9a3412}
+      .d-hname{font:700 12px Inter,Arial,sans-serif;fill:#fff}
+      .d-htag{font:600 9px Inter,Arial,sans-serif;fill:#cbd5e1;letter-spacing:0.06em}
+      .d-col{font:500 10px ui-monospace,Menlo,monospace;fill:#334155}
+      .d-pk{font:700 10px ui-monospace,Menlo,monospace;fill:#0f172a}
+      .d-fk{font:600 10px ui-monospace,Menlo,monospace;fill:#b34700}
+      .d-lbl{font:600 10px Inter,Arial,sans-serif;fill:#0f172a}
+      .d-rel{stroke:#4dbab9;stroke-width:1.6;fill:none;marker-end:url(#dArrT)}
+      .d-relSoft{stroke:#94a3b8;stroke-width:1.3;fill:none;stroke-dasharray:4 4;marker-end:url(#dArrG)}
+      .d-legend{font:500 10px Inter,Arial,sans-serif;fill:#334155}
+    </style>
+    <marker id="dArrT" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#4dbab9"/></marker>
+    <marker id="dArrG" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#94a3b8"/></marker>
+    <filter id="dSh" x="-8%" y="-8%" width="116%" height="125%"><feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#0f172a" flood-opacity="0.06"/></filter>
+  </defs>
+  <rect class="d-bg" width="820" height="620"/>
+
+  <!-- Legend -->
+  <rect x="540" y="10" width="270" height="44" rx="4" fill="#fff" stroke="#dbe5ee"/>
+  <rect x="552" y="22" width="12" height="10" rx="2" class="d-tblImm"/>
+  <text x="570" y="32" class="d-legend">immutable</text>
+  <rect x="638" y="22" width="12" height="10" rx="2" class="d-tblInb"/>
+  <text x="656" y="32" class="d-legend">inbox</text>
+  <rect x="700" y="22" width="12" height="10" rx="2" class="d-tblAud"/>
+  <text x="718" y="32" class="d-legend">audit</text>
+  <text x="552" y="48" class="d-pk">★</text>
+  <text x="562" y="48" class="d-legend">PK</text>
+  <text x="586" y="48" class="d-fk">→</text>
+  <text x="600" y="48" class="d-legend">FK</text>
+  <line x1="630" y1="46" x2="650" y2="46" class="d-rel"/>
+  <text x="654" y="50" class="d-legend">hard</text>
+  <line x1="688" y1="46" x2="708" y2="46" class="d-relSoft"/>
+  <text x="712" y="50" class="d-legend">soft / poly</text>
+
+  <!-- Row 1 -->
+  <g transform="translate(14,80)">
+    <rect width="155" height="98" rx="6" class="d-tbl" filter="url(#dSh)"/>
+    <rect width="155" height="24" rx="6" class="d-hdr"/>
+    <rect y="18" width="155" height="6" class="d-hdr"/>
+    <text x="10" y="16" class="d-hname">brand</text>
+    <text x="120" y="14" class="d-htag">CORE</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-col">name</text>
+    <text x="10" y="76" class="d-col">tier (1|2|3)</text>
+    <text x="10" y="92" class="d-col">fallback_policy</text>
+  </g>
+
+  <g transform="translate(189,80)">
+    <rect width="195" height="98" rx="6" class="d-tblImm" filter="url(#dSh)"/>
+    <rect width="195" height="24" rx="6" class="d-hdrImm"/>
+    <rect y="18" width="195" height="6" class="d-hdrImm"/>
+    <text x="10" y="16" class="d-hname">identity_version</text>
+    <text x="146" y="14" class="d-htag">IMMUT.</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-fk">→ brand_id</text>
+    <text x="10" y="76" class="d-col">reference_image_keys[]</text>
+    <text x="10" y="92" class="d-col">reference_embeddings[]</text>
+  </g>
+
+  <g transform="translate(404,80)">
+    <rect width="180" height="98" rx="6" class="d-tbl" filter="url(#dSh)"/>
+    <rect width="180" height="24" rx="6" class="d-hdr"/>
+    <rect y="18" width="180" height="6" class="d-hdr"/>
+    <text x="10" y="16" class="d-hname">source_clip</text>
+    <text x="140" y="14" class="d-htag">MEDIA</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-col">r2_key, sha256</text>
+    <text x="10" y="76" class="d-col">anchor_frame_idx</text>
+    <text x="10" y="92" class="d-col">status, duration_ms</text>
+  </g>
+
+  <g transform="translate(604,80)">
+    <rect width="202" height="98" rx="6" class="d-tblImm" filter="url(#dSh)"/>
+    <rect width="202" height="24" rx="6" class="d-hdrImm"/>
+    <rect y="18" width="202" height="6" class="d-hdrImm"/>
+    <text x="10" y="16" class="d-hname">prompt_version</text>
+    <text x="150" y="14" class="d-htag">IMMUT.</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-col">provider, stage</text>
+    <text x="10" y="76" class="d-col">template, params jsonb</text>
+    <text x="10" y="92" class="d-col">status (draft|active|archived)</text>
+  </g>
+
+  <line x1="169" y1="115" x2="189" y2="115" class="d-rel"/>
+  <text x="171" y="108" class="d-lbl">1:N</text>
+
+  <!-- batch -->
+  <g transform="translate(290,220)">
+    <rect width="240" height="120" rx="6" class="d-tbl" filter="url(#dSh)"/>
+    <rect width="240" height="24" rx="6" class="d-hdr"/>
+    <rect y="18" width="240" height="6" class="d-hdr"/>
+    <text x="10" y="16" class="d-hname">batch</text>
+    <text x="166" y="14" class="d-htag">OPERATIONAL</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-col">operator_id, source_pool_id</text>
+    <text x="10" y="76" class="d-fk">→ identity_version_ids jsonb</text>
+    <text x="10" y="92" class="d-fk">→ image_prompt_version_id</text>
+    <text x="10" y="108" class="d-fk">→ motion_prompt_version_id</text>
+  </g>
+
+  <path d="M286 178 Q286 200 320 220" class="d-rel"/>
+  <text x="230" y="196" class="d-lbl">pinned per brand</text>
+
+  <path d="M704 178 Q704 200 510 220" class="d-rel"/>
+  <text x="588" y="200" class="d-lbl">×2 (image, motion)</text>
+
+  <!-- batch_item -->
+  <g transform="translate(290,380)">
+    <rect width="240" height="106" rx="6" class="d-tbl" filter="url(#dSh)"/>
+    <rect width="240" height="24" rx="6" class="d-hdr"/>
+    <rect y="18" width="240" height="6" class="d-hdr"/>
+    <text x="10" y="16" class="d-hname">batch_item</text>
+    <text x="156" y="14" class="d-htag">OPERATIONAL</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-fk">→ batch_id, clip_id, brand_id</text>
+    <text x="10" y="76" class="d-fk">→ identity_version_id</text>
+    <text x="10" y="92" class="d-col">status, current_stage, attempt_no</text>
+  </g>
+
+  <line x1="410" y1="340" x2="410" y2="380" class="d-rel"/>
+  <text x="416" y="364" class="d-lbl">1:N</text>
+
+  <path d="M494 178 Q494 280 524 380" class="d-rel"/>
+  <text x="498" y="280" class="d-lbl">N:1</text>
+
+  <!-- attempt -->
+  <g transform="translate(40,520)">
+    <rect width="320" height="90" rx="6" class="d-tbl" filter="url(#dSh)"/>
+    <rect width="320" height="24" rx="6" class="d-hdr"/>
+    <rect y="18" width="320" height="6" class="d-hdr"/>
+    <text x="10" y="16" class="d-hname">batch_item_attempt</text>
+    <text x="220" y="14" class="d-htag">APPEND-ONLY</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-fk">→ batch_item_id, provider, provider_job_id</text>
+    <text x="10" y="76" class="d-col">prompt_resolved_hash, identity_score, error_class</text>
+  </g>
+
+  <path d="M340 486 Q340 510 250 520" class="d-rel"/>
+  <text x="276" y="510" class="d-lbl">1:N</text>
+
+  <!-- inbox -->
+  <g transform="translate(390,520)">
+    <rect width="220" height="90" rx="6" class="d-tblInb" filter="url(#dSh)"/>
+    <rect width="220" height="24" rx="6" class="d-hdrInb"/>
+    <rect y="18" width="220" height="6" class="d-hdrInb"/>
+    <text x="10" y="16" class="d-hname">provider_event_inbox</text>
+    <text x="172" y="14" class="d-htag">INBOX</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-col">provider, event_id (UNIQUE)</text>
+    <text x="10" y="76" class="d-col">signature_verified, payload</text>
+  </g>
+
+  <line x1="390" y1="555" x2="360" y2="555" class="d-relSoft"/>
+  <text x="362" y="548" class="d-lbl">soft, by provider_job_id</text>
+
+  <!-- operator_action -->
+  <g transform="translate(640,520)">
+    <rect width="166" height="90" rx="6" class="d-tblAud" filter="url(#dSh)"/>
+    <rect width="166" height="24" rx="6" class="d-hdrAud"/>
+    <rect y="18" width="166" height="6" class="d-hdrAud"/>
+    <text x="10" y="16" class="d-hname">operator_action</text>
+    <text x="124" y="14" class="d-htag">AUDIT</text>
+    <text x="10" y="44" class="d-pk">★ id</text>
+    <text x="10" y="60" class="d-col">operator_id</text>
+    <text x="10" y="76" class="d-col">target (poly), action</text>
+  </g>
+
+  <path d="M640 540 Q540 470 410 460" class="d-relSoft"/>
+  <text x="500" y="490" class="d-lbl">poly ref → batch, batch_item, identity_version…</text>
+</svg>
+
+<pre><code>brand
+  id, name, tier (1|2|3), fallback_policy, identity_threshold, ...
+
+identity_version            -- immutable after publish
+  id, brand_id, version_no,
+  reference_image_keys: text[],          -- R2 keys
+  reference_embeddings: vector(512)[],   -- ArcFace face embeddings
+  per_provider_conditioning: jsonb,      -- LoRA refs, IP-Adapter latents, char-ref ids
+  baseline_score: float,
+  published_at, published_by, retired_at
+
+source_clip
+  id, source_account, apify_run_id, fetched_at,
+  r2_key_original, sha256, duration_ms, width, height, codec,
+  anchor_frame_idx (nullable),           -- scored once, cached
+  status (active|removed_upstream|quarantined)
+
+prompt_version
+  id, provider, stage (image|motion),
+  template (jsonb),                      -- variables not yet substituted
+  params (jsonb),                        -- cfg, steps, seed_policy, etc
+  parent_id, status (draft|active|archived),
+  created_by, created_at
+
+batch
+  id, operator_id, source_pool_id, brand_ids: int[],
+  identity_version_ids: jsonb,           -- {brand_id: identity_version_id}, pinned at start
+  image_prompt_version_id, motion_prompt_version_id,
+  provider_chain_id,
+  status (queued|running|paused|completed|aborted),
+  cost_cap_cents, cost_spent_cents,
+  created_at, completed_at
+
+batch_item
+  id, batch_id, clip_id, brand_id, identity_version_id,
+  status (pending|running|needs_operator|succeeded|failed|skipped),
+  current_stage (intake|anchor|image|motion|finalize|done),
+  attempt_no, last_error_class, cost_cents,
+  final_output_r2_key (nullable)
+
+batch_item_attempt           -- one row per external call. ever.
+  id, batch_item_id, stage, provider,
+  provider_job_id (nullable),            -- written BEFORE awaiting
+  started_at, finished_at,
+  status (dispatched|running|succeeded|failed|cancelled),
+  prompt_resolved_hash,                  -- hash of the SUBSTITUTED payload
+  identity_hash,
+  output_r2_key (nullable),
+  identity_score (nullable),
+  error_class, error_payload, cost_cents
+
+provider_event_inbox         -- webhook landing zone
+  id, provider, event_id (unique),       -- idempotency key from provider
+  signature_verified bool, received_at,
+  payload jsonb, consumed_at (nullable), consumer_lease_id
+
+operator_action              -- audit
+  id, operator_id, target_type, target_id, action, payload, created_at
+</code></pre>
+
+<h3>Key invariants</h3>
+<ol>
+  <li><strong>Attempts are append-only.</strong> Every dispatched external call writes a row before the call awaits. No row = no spend. Crash-resume reads the table to decide whether to poll or re-dispatch.</li>
+  <li><strong>Identities are immutable per version.</strong> Editing a brand identity creates a new <code>identity_version</code>; runs pin to the version id at batch start.</li>
+  <li><strong>R2 keys are content-addressable.</strong> Same input × same prompt × same identity → same key. Retries are free if the work already happened.</li>
+  <li><strong>Prompt comparison is on <code>prompt_resolved_hash</code>, not template id.</strong> Templates with variables can drift while the version id stays constant.</li>
+</ol>
+
+<h2 id="failures">3. Failure modes under real volume</h2>
+
+<p>Things that actually bite, not generic "rate limits."</p>
+
+<h3>3.1 Silent identity drift across the fallback chain</h3>
+<p><span class="tag">Quality</span> NBP, Flux Kontext Max and Seedream v4.5 do not encode identity conditioning the same way. Flux's IP-Adapter-style input lands differently than NBP's character reference; Seedream has its own identity head. When NBP 5xx's and the chain falls over, the regenerated face is visibly different — close enough to pass a glance, obviously off on a second viewing.</p>
+<p><strong>Mitigation.</strong> Tag every output with the provider that actually produced it (surface this in UI, not just audit). Make the chain <strong>per-brand-tier</strong>, not global — tier-1 brands stall instead of fall back, tier-2 fall back to Flux only, tier-3 use the full chain. Pre-score each provider's per-brand identity fidelity offline so the chain order is graded, not sequence-of-registration.</p>
+
+<h3>3.2 First frame is the wrong frame</h3>
+<p><span class="tag">Quality</span> ffmpeg frame-0 on a TikTok/IG re-encode often lands on a blink, mid-phoneme, motion-blurred, or under the "Original Sound" overlay. You regenerate identity onto a bad anchor, motion-condition on the bad anchor, and the first 150–300ms of the output morph-pops as the motion model stabilises.</p>
+<p><strong>Mitigation.</strong> Score frames 0–15 on a window: face visibility (detector), blur (Laplacian variance), eyes-open (landmark), occlusion, overlay-text density. Pick the best one as <code>anchor_frame_idx</code> and persist it on <code>source_clip</code>. Motion stage gets the same offset.</p>
+
+<h3>3.3 Apify source decay between selection and run</h3>
+<p><span class="tag">Data</span> Operator curates 50 clips Monday; Wednesday's batch finds 7 source URLs 404 because the upstream was deleted or made private. Apify silently returns partial / stale results on a re-pull. Lazy re-fetch in the worker means R2 404s after image gen has already spent credits.</p>
+<p><strong>Mitigation.</strong> Copy-on-pull from Apify into R2 at intake, checksum, and <strong>never re-fetch source upstream</strong> for the rest of the lifecycle. Pipeline only talks to R2. Add an <code>active|removed_upstream</code> column for client-side reporting, not pipeline behaviour.</p>
+
+<h3>3.4 Signed-URL TTL &lt; motion provider fetch latency</h3>
+<p><span class="tag">Plumbing</span> Kling queues — submission to actual asset-pull can be minutes when their cluster is hot. Short-TTL R2 signed URLs 4xx <em>after</em> image gen has already spent. Retry generates a fresh identity frame = a different face. The audit looks like "transient failure" when it's a token expiry problem.</p>
+<p><strong>Mitigation.</strong> Long-TTL presigned URLs (12–24h) for provider-facing handoffs, or proxy through an internal short-lived presigner the provider can refresh. Image-gen output is content-addressable on R2 so retries reuse the same frame.</p>
+
+<h3>3.5 Credit exhaustion as a retry storm</h3>
+<p><span class="tag">Cost</span> Provider 402/insufficient looks identical to a transient 5xx to a naive retry policy. Workers hot-retry, queue saturates, and nothing useful happens until a human notices the spend has stopped going up.</p>
+<p><strong>Mitigation.</strong> Pre-flight credit estimate per batch with hard cap. 402 is a <strong>circuit-breaker</strong>, not a retryable error — pause the whole batch, alert, resume on top-up. Per-provider credit balance is polled hourly and surfaced as a metric (see §9).</p>
+
+<h3>3.6 At-least-once delivery × non-idempotent provider calls = double spend</h3>
+<p><span class="tag">Correctness</span> Worker crashes after dispatching a generation but before persisting <code>provider_job_id</code>. Job is redelivered, second call goes out, two outputs are produced, two charges land. At 200 clips × 3-provider fallback this is easily 4–5% of spend.</p>
+<p><strong>Mitigation.</strong> Idempotency key on every external call: <code>sha256(clip_id, attempt_no, provider, prompt_resolved_hash, identity_hash)</code>. Write <code>batch_item_attempt</code> row with <code>status=dispatched</code> <em>before</em> awaiting the call. On resume, look up <code>provider_job_id</code> and poll instead of re-dispatching. If the provider supports idempotency tokens, send the same key.</p>
+
+<h3>3.7 Brand identity bundle edited in place</h3>
+<p><span class="tag">Drift</span> Operator "tweaks" the brand reference images to fix a bad batch. All historical runs are now incomparable — the identity they claim to use isn't what's in the registry now. Drift detection becomes meaningless.</p>
+<p><strong>Mitigation.</strong> Identity is versioned and immutable per version. Runs pin <code>identity_version_id</code>, never <code>brand_id</code>. New references = new version. Old versions retired, not edited.</p>
+
+<h3>3.8 Motion provider content-safety rejections that look like generic failures</h3>
+<p><span class="tag">Provider</span> Kling's safety filter is twitchy on mouths/eyes and produces ambiguous error codes. Without a typed error taxonomy, the operator sees "failed" with no actionable next step.</p>
+<p><strong>Mitigation.</strong> Normalise provider errors into a typed taxonomy — <code>{transient, credits, safety, input_invalid, identity_low_score, unknown}</code> — drive the retry/surface decision off the type, not the HTTP code (§4).</p>
+
+<h3>3.9 Webhook delivery is unreliable and re-orderable</h3>
+<p><span class="tag">Plumbing</span> Providers retry webhooks on 5xx, give up after N tries, and don't guarantee order. A <code>job.succeeded</code> can arrive before <code>job.running</code>; a duplicate <code>job.succeeded</code> can arrive an hour later. If the receiver crashes between accepting the HTTP request and persisting the event, the event is lost.</p>
+<p><strong>Mitigation.</strong> Webhook receiver writes to <code>provider_event_inbox</code> in a single transaction; HTTP 200 is only returned after commit. State machine only advances forward — a late "running" cannot undo a "succeeded". Idempotent on provider's <code>event_id</code>. Reconciler covers the case where the webhook never arrives. (See §5.)</p>
+
+<h3>3.10 ffmpeg version skew on source codecs</h3>
+<p><span class="tag">Plumbing</span> An ffmpeg upgrade in the worker image silently breaks frame extraction on a subset of re-encodes (returns a green frame, wrong PTS, or off-by-one frame). Identity score plummets across all affected clips but the operator sees no error.</p>
+<p><strong>Mitigation.</strong> Pin ffmpeg version; golden-frame test in CI on a fixed library of weird source codecs. Alert on pixel-entropy outliers (a green frame has a distribution signature). Worker image SHA in every <code>batch_item_attempt</code>.</p>
+
+<h3>3.11 R2 multipart and concurrent-write quirks</h3>
+<p><span class="tag">Plumbing</span> Two workers writing the same content-addressable key concurrently is fine; two workers writing the same <em>metadata</em> object (e.g. a manifest) is not. R2 is eventually consistent on list operations, strongly consistent on get-after-put for the same key.</p>
+<p><strong>Mitigation.</strong> Never use list-after-write as a synchronisation point. Manifests are in Postgres, not R2. Object keys, not paths, are the source of truth.</p>
+
+<h2 id="batch">4. Batch controls</h2>
+
+<h3>4.1 Stage state machine</h3>
+<p>One state machine per <code>batch_item</code>, executed by the worker for whichever stage matches <code>current_stage</code>:</p>
+
+<svg class="diagram" viewBox="0 0 820 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stage progression and per-stage state machine">
+  <defs>
+    <style>
+      .sm-bg{fill:#f8fafc}
+      .sm-card{fill:#fff;stroke:#dbe5ee;stroke-width:1.4}
+      .sm-pending{fill:#fff;stroke:#94a3b8;stroke-width:1.6}
+      .sm-running{fill:#e9fbfb;stroke:#4dbab9;stroke-width:1.6}
+      .sm-succeeded{fill:#ecfdf5;stroke:#10b981;stroke-width:1.6}
+      .sm-needs{fill:#fff7ed;stroke:#f97316;stroke-width:1.6}
+      .sm-failed{fill:#fef2f2;stroke:#ef4444;stroke-width:1.6}
+      .sm-skipped{fill:#f1f5f9;stroke:#64748b;stroke-width:1.6}
+      .sm-done{fill:#dcfce7;stroke:#15803d;stroke-width:2}
+      .sm-h{font:700 12px Inter,Arial,sans-serif;fill:#0f172a}
+      .sm-t{font:500 10px Inter,Arial,sans-serif;fill:#475569}
+      .sm-sec{font:600 10px Inter,Arial,sans-serif;fill:#64748b;letter-spacing:0.06em;text-transform:uppercase}
+      .sm-state{font:700 13px Inter,Arial,sans-serif;fill:#0f172a;text-anchor:middle}
+      .sm-sub{font:500 9.5px Inter,Arial,sans-serif;fill:#475569;text-anchor:middle}
+      .sm-lbl{font:500 10px Inter,Arial,sans-serif;fill:#475569;font-style:italic}
+      .sm-good{stroke:#10b981;stroke-width:1.6;fill:none;marker-end:url(#smArG)}
+      .sm-warn{stroke:#f97316;stroke-width:1.6;fill:none;marker-end:url(#smArW)}
+      .sm-bad{stroke:#ef4444;stroke-width:1.6;fill:none;marker-end:url(#smArB)}
+      .sm-blk{stroke:#0f172a;stroke-width:1.4;fill:none;marker-end:url(#smArK)}
+      .sm-teal{stroke:#4dbab9;stroke-width:1.8;fill:none;marker-end:url(#smArT)}
+    </style>
+    <marker id="smArG" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#10b981"/></marker>
+    <marker id="smArW" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#f97316"/></marker>
+    <marker id="smArB" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#ef4444"/></marker>
+    <marker id="smArK" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#0f172a"/></marker>
+    <marker id="smArT" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M2 2 L7 4.5 L2 7 Z" fill="#4dbab9"/></marker>
+    <filter id="smSh" x="-8%" y="-8%" width="116%" height="125%"><feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#0f172a" flood-opacity="0.06"/></filter>
+  </defs>
+  <rect class="sm-bg" width="820" height="420"/>
+
+  <text x="14" y="22" class="sm-sec">Stage Progression</text>
+  <line x1="14" y1="30" x2="806" y2="30" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="2 3"/>
+
+  <rect x="14" y="40" width="118" height="44" rx="9" class="sm-card" filter="url(#smSh)"/>
+  <text x="28" y="60" class="sm-h">1 · intake</text>
+  <text x="28" y="76" class="sm-t">Apify → R2</text>
+
+  <rect x="143" y="40" width="118" height="44" rx="9" class="sm-card" filter="url(#smSh)"/>
+  <text x="157" y="60" class="sm-h">2 · anchor</text>
+  <text x="157" y="76" class="sm-t">ffmpeg</text>
+
+  <rect x="272" y="40" width="118" height="44" rx="9" class="sm-card" filter="url(#smSh)"/>
+  <text x="286" y="60" class="sm-h">3 · image_gen</text>
+  <text x="286" y="76" class="sm-t">WaveSpeed</text>
+
+  <rect x="401" y="40" width="118" height="44" rx="9" class="sm-card" filter="url(#smSh)"/>
+  <text x="415" y="60" class="sm-h">4 · motion</text>
+  <text x="415" y="76" class="sm-t">WS / Kling</text>
+
+  <rect x="530" y="40" width="118" height="44" rx="9" class="sm-card" filter="url(#smSh)"/>
+  <text x="544" y="60" class="sm-h">5 · finalize</text>
+  <text x="544" y="76" class="sm-t">persist + done</text>
+
+  <rect x="659" y="40" width="118" height="44" rx="9" class="sm-done" filter="url(#smSh)"/>
+  <text x="718" y="60" class="sm-state">done</text>
+  <text x="718" y="76" class="sm-sub">item terminal</text>
+
+  <line x1="132" y1="62" x2="143" y2="62" class="sm-teal"/>
+  <line x1="261" y1="62" x2="272" y2="62" class="sm-teal"/>
+  <line x1="390" y1="62" x2="401" y2="62" class="sm-teal"/>
+  <line x1="519" y1="62" x2="530" y2="62" class="sm-teal"/>
+  <line x1="648" y1="62" x2="659" y2="62" class="sm-teal"/>
+
+  <text x="14" y="116" class="sm-sec">Per-Stage State Machine</text>
+  <line x1="14" y1="124" x2="806" y2="124" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="2 3"/>
+
+  <rect x="20" y="200" width="130" height="56" rx="28" class="sm-pending" filter="url(#smSh)"/>
+  <text x="85" y="226" class="sm-state">pending</text>
+  <text x="85" y="242" class="sm-sub">awaiting worker</text>
+
+  <rect x="220" y="200" width="130" height="56" rx="28" class="sm-running" filter="url(#smSh)"/>
+  <text x="285" y="226" class="sm-state">running</text>
+  <text x="285" y="242" class="sm-sub">dispatched, awaiting</text>
+
+  <rect x="420" y="148" width="190" height="50" rx="25" class="sm-succeeded" filter="url(#smSh)"/>
+  <text x="515" y="172" class="sm-state">succeeded</text>
+  <text x="515" y="188" class="sm-sub">advance stage / done</text>
+
+  <rect x="420" y="212" width="190" height="50" rx="25" class="sm-needs" filter="url(#smSh)"/>
+  <text x="515" y="236" class="sm-state">needs_operator</text>
+  <text x="515" y="252" class="sm-sub">surfaced to UI</text>
+
+  <rect x="420" y="276" width="190" height="50" rx="25" class="sm-failed" filter="url(#smSh)"/>
+  <text x="515" y="300" class="sm-state">failed</text>
+  <text x="515" y="316" class="sm-sub">retry candidate</text>
+
+  <rect x="640" y="276" width="160" height="50" rx="25" class="sm-skipped" filter="url(#smSh)"/>
+  <text x="720" y="300" class="sm-state">skipped</text>
+  <text x="720" y="316" class="sm-sub">chain exhausted</text>
+
+  <line x1="150" y1="228" x2="220" y2="228" class="sm-blk"/>
+  <text x="156" y="220" class="sm-lbl">worker leases · attempt++</text>
+
+  <path d="M345 210 Q380 192 420 175" class="sm-good"/>
+  <text x="354" y="190" class="sm-lbl">ok</text>
+
+  <line x1="350" y1="232" x2="420" y2="236" class="sm-warn"/>
+  <text x="356" y="228" class="sm-lbl">low_score · safety · unknown</text>
+
+  <path d="M345 250 Q380 268 420 294" class="sm-bad"/>
+  <text x="354" y="280" class="sm-lbl">transient · input_invalid</text>
+
+  <path d="M420 308 Q230 360 85 256" class="sm-bad"/>
+  <text x="210" y="350" class="sm-lbl">retry · exp backoff · ≤3 attempts</text>
+
+  <line x1="610" y1="301" x2="640" y2="301" class="sm-bad"/>
+  <text x="608" y="294" class="sm-lbl">chain exhausted + skip</text>
+
+  <text x="14" y="400" class="sm-lbl">Resume rule · if provider_job_id present, poll it; else re-dispatch with new idempotency key. Append-only attempts make this safe at any boot.</text>
+</svg>
+
+<h3>4.2 Retry / skip / surface policy by error class</h3>
+
+<table>
+<thead><tr><th>Class</th><th>Action</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>transient</code></td><td>Exp backoff, ≤3 in-stage; then next provider in chain.</td><td>Network/5xx — cost is just retry time.</td></tr>
+<tr><td><code>credits</code> (402)</td><td>Circuit-break whole batch. Pause. Alert.</td><td>Retrying without credits is pure noise.</td></tr>
+<tr><td><code>safety</code></td><td>Next provider in chain <em>iff</em> brand policy permits crossover; else <code>needs_operator</code>.</td><td>Same prompt + different provider sometimes passes; for tier-1 brands this is a quality risk.</td></tr>
+<tr><td><code>input_invalid</code></td><td>One retry with alternate <code>anchor_frame_idx</code>; else <code>needs_operator</code>.</td><td>Bad frame is the common cause; one cheap retry is worth it.</td></tr>
+<tr><td><code>identity_low_score</code></td><td>Never auto-retry. Surface to operator with bad output.</td><td>Auto-retry burns credits; humans catch identity better than any threshold.</td></tr>
+<tr><td><code>unknown</code></td><td>Surface immediately.</td><td>Blind retry on unknown is how you burn $500 overnight.</td></tr>
+</tbody>
+</table>
+
+<h3>4.3 Resumability</h3>
+<p>Worker boot procedure (idempotent, safe to run any time):</p>
+<ol>
+  <li>Find <code>batch_item</code>s with <code>status=running</code>. For each, load most recent <code>batch_item_attempt</code> with <code>status=dispatched</code>.</li>
+  <li>If <code>provider_job_id IS NOT NULL</code> → poll provider. If terminal, persist result; advance stage. If still running, leave it for the reconciler. If failed, classify and re-enter §4.2.</li>
+  <li>If <code>provider_job_id IS NULL</code> → crashed pre-dispatch. Bump <code>attempt_no</code>, re-dispatch with new idempotency key. No double-spend because nothing was charged.</li>
+</ol>
+<p>This is the only resume path. There is no "restart the batch from scratch" button — it would re-spend everything.</p>
+
+<h3>4.4 What the operator sees</h3>
+<ul>
+  <li><strong>Live counts</strong> per stage per status, refreshed via SSE or short-poll.</li>
+  <li><strong>Per-clip card</strong>: source thumbnail → regenerated frame → motion preview (each appears as the stage completes), with a provider badge.</li>
+  <li><strong>Running cost vs cap</strong>, and ETA from rolling per-stage latency.</li>
+  <li><strong>Surface queue</strong>: a dedicated panel of items in <code>needs_operator</code> — low identity score, content rejection, ambiguous failure. Operator picks: approve-as-is / regenerate (new seed) / regenerate (alt anchor frame) / skip.</li>
+  <li><strong>Per-brand sub-progress</strong>, because operators usually care about one brand at a time even when the batch spans many.</li>
+  <li><strong>Pause / resume</strong> at batch level. Pause halts dispatch on uncompleted items; in-flight attempts continue (you cannot un-spend).</li>
+</ul>
+
+<h3>4.5 Decision rule</h3>
+<p><strong>Retry</strong> only for <code>transient</code> and the one alternate-frame attempt on <code>input_invalid</code>. <strong>Skip</strong> is automatic only when the chain is exhausted <em>and</em> brand policy is <code>skip_rather_than_degrade</code>. <strong>Surface</strong> is the default for anything ambiguous. Ten seconds of operator attention is cheaper than $0.40 of credits spent on a guess.</p>
+
+<h2 id="async">5. Async jobs: webhooks, polling, reconciliation</h2>
+
+<p>Provider APIs are asynchronous and unreliable. Webhook-only is brittle; polling-only is slow and wasteful; you need both.</p>
+
+<h3>5.1 Webhook path (fast path)</h3>
+<ol>
+  <li>Provider POSTs to <code>/webhook/{provider}</code>.</li>
+  <li>Receiver verifies HMAC signature against the versioned secret. Reject unsigned/invalid.</li>
+  <li>Receiver INSERTs into <code>provider_event_inbox</code> with the provider's <code>event_id</code> as a unique key. Duplicates are a no-op (<code>ON CONFLICT DO NOTHING</code>). Commit, then 200.</li>
+  <li>A small worker pool drains the inbox, advances state machines, writes outputs to R2 if needed.</li>
+</ol>
+<p><strong>Why the inbox.</strong> Decouples HTTP availability from business logic. Receiver only has to be fast and idempotent. Even if the consumer is down for an hour, no events are lost. Replay is just re-running the consumer.</p>
+
+<h3>5.2 Polling path (reconciliation)</h3>
+<p>Cron every 30–60s:</p>
+<pre><code>SELECT * FROM batch_item_attempt
+WHERE status IN ('dispatched','running')
+  AND finished_at IS NULL
+  AND started_at &lt; now() - interval '90 seconds';</code></pre>
+<p>For each, poll the provider directly by <code>provider_job_id</code>. If terminal, advance. If still running, update <code>updated_at</code> and move on. This catches:</p>
+<ul>
+  <li>Webhook never delivered (provider gave up, our endpoint had an outage).</li>
+  <li>Webhook silently lost between receiver and consumer (rare with the inbox, but possible during DB outages).</li>
+  <li>Jobs the provider considers complete but never sent a final webhook for.</li>
+</ul>
+
+<h3>5.3 Ordering &amp; idempotency</h3>
+<ul>
+  <li>State machine only advances forward. A <code>running</code> event after <code>succeeded</code> is dropped.</li>
+  <li>Output writes to R2 use content-addressable keys; a duplicate <code>succeeded</code> overwriting the same bytes is harmless.</li>
+  <li>The consumer takes a <code>FOR UPDATE SKIP LOCKED</code> lease on the inbox row so two consumers can't process the same event concurrently.</li>
+</ul>
+
+<h3>5.4 Variable latency &amp; concurrency</h3>
+<p>Per-provider concurrent-job limits live in <code>provider_chain_config</code>. The image-gen queue worker takes a token from a Postgres-backed semaphore (or a Redis one if you have it) before dispatching, releases on terminal. This is how you respect "Kling allows N concurrent per account" without spreading config knowledge across every worker.</p>
+
+<h2 id="prompts">6. Prompt versioning</h2>
+
+<ul>
+  <li>Prompts are rows, not strings in code. <code>prompt_version(id, provider, stage, template, params, parent_id, status)</code>.</li>
+  <li>Every run pins <code>(image_prompt_version_id, motion_prompt_version_id)</code>. Never "current."</li>
+  <li><strong>Store the resolved payload</strong> sent to the provider as <code>prompt_resolved_hash</code> on each attempt. Templates with variable substitution drift even while the version id is constant — without the resolved hash, two runs can claim the same prompt but be different in practice.</li>
+  <li>"Active" is a pointer per <code>(provider, stage)</code>; rollback is a pointer flip. Historical runs keep their pin and stay comparable.</li>
+  <li>A/B: two <code>active</code> variants per stage with a traffic split. <code>batch_item_attempt</code> carries which arm. Comparison is just SQL on identity scores grouped by prompt version.</li>
+  <li>Promote/demote is an <code>operator_action</code> audit row. Who flipped the active prompt and when is always recoverable.</li>
+</ul>
+
+<h2 id="identity">7. Brand-identity preservation</h2>
+
+<p>Identity is a versioned bundle, not a folder:</p>
+<pre><code>identity_version
+  id, brand_id, version_no,
+  reference_image_keys: text[],              -- 3–10 R2 keys
+  reference_embeddings: vector(512)[],       -- ArcFace, computed once at publish
+  per_provider_conditioning: jsonb,          -- LoRA refs, IP-Adapter latents, char-ref ids
+  baseline_score: float,                     -- mean cosine on a holdout
+  published_at, retired_at</code></pre>
+
+<h3>Per-output eval</h3>
+<ol>
+  <li>Compute face embedding on the regenerated first frame (single ArcFace pass, cheap).</li>
+  <li>Cosine similarity vs the identity's reference embeddings (mean of top-k matches).</li>
+  <li>Persist as <code>batch_item_attempt.identity_score</code>.</li>
+  <li>Below brand-specific threshold → classify as <code>identity_low_score</code>, surface.</li>
+</ol>
+
+<p>Why face embeddings: cheap, robust to lighting/pose, provider-agnostic, and the threshold is the only knob (set per brand because tolerance varies — polished talent vs UGC creator).</p>
+
+<h2 id="drift">8. Silent drift detection</h2>
+
+<p>Six signals, in rough order of usefulness:</p>
+<ol>
+  <li><strong>Identity score rolling mean per (brand, provider, prompt_version)</strong>. Flag on &gt; N-sigma drop over 7 days. Slice by provider — drift is usually one provider, not all.</li>
+  <li><strong>Operator approval rate</strong> = succeeded with no regen / total surfaced. Best <em>leading</em> indicator. When this drops, something has changed even if scores haven't.</li>
+  <li><strong>Distribution shift on identity score</strong> — weekly KS test on the score distribution vs the prior 4 weeks. Catches "the mean is fine but the tail got worse."</li>
+  <li><strong>Motion start-frame fidelity</strong> = SSIM between regenerated anchor frame and motion-output frame 0. Widening means the motion provider has started ignoring conditioning more (their model update, not yours).</li>
+  <li><strong>Cost per approved output</strong>. Climbs before quality breaks visibly because retries silently rise first.</li>
+  <li><strong>Canary clips</strong> — ~10 fixed source clips × identity versions × frozen prompt versions, processed nightly, scored against a baseline. Cleanest signal because everything else is controlled; if canary moves, only the provider has changed.</li>
+</ol>
+<p>Weekly dashboard, per-brand and per-provider. No human watches outputs; humans watch deltas.</p>
+
+<h2 id="obs">9. Observability</h2>
+
+<h4>Metrics</h4>
+<ul>
+  <li>Queue depth and oldest-pending-age per stage.</li>
+  <li>p50/p95 latency per (stage, provider).</li>
+  <li>Error rate per (stage, provider, error_class).</li>
+  <li>Identity score histogram per (brand, provider, prompt_version).</li>
+  <li>Cost per approved output, per brand.</li>
+  <li>Per-provider credit balance (polled, alert on threshold).</li>
+  <li>Webhook inbox lag (received_at → consumed_at).</li>
+  <li>Reconciler hit rate (= % of jobs resolved by polling vs webhook). Climbing means webhooks are degrading.</li>
+</ul>
+
+<h4>Traces</h4>
+<p>Span per stage, propagated through dispatch. Tags: <code>batch_id, batch_item_id, attempt_id, provider, provider_job_id, prompt_version_id, identity_version_id</code>. Lets you walk from an operator action to a final output through every external call.</p>
+
+<h4>Logs</h4>
+<p>Structured JSON, always carrying <code>{batch_id, batch_item_id, attempt_id}</code>. Provider request/response payloads logged at debug, redacted of secrets, sampled at info.</p>
+
+<h4>Dashboards</h4>
+<ul>
+  <li><strong>Ops view.</strong> Queue depths, error rates by class, credit balances, webhook lag.</li>
+  <li><strong>Quality view.</strong> Identity score trend, approval rate, KS-test status, canary results.</li>
+  <li><strong>Per-batch view.</strong> Operator's live view (§4.4) is also this dashboard.</li>
+</ul>
+
+<h4>Alerts</h4>
+<ul>
+  <li>Credit balance &lt; N hours of forecast burn.</li>
+  <li>Error rate by class &gt; threshold for 10 min.</li>
+  <li>Identity score 7-day mean drop &gt; N sigma.</li>
+  <li>Reconciler resolving &gt; 30% of jobs (webhook path degraded).</li>
+  <li>Queue depth growing 15+ min on any stage.</li>
+</ul>
+
+<h2 id="sec">10. Security &amp; governance</h2>
+
+<ul>
+  <li><strong>Identity reference data is PII / likeness</strong> in most jurisdictions. Encrypted at rest in R2, scoped credentials per environment, signed-URL-only access. No public buckets, ever.</li>
+  <li><strong>Outbound data inventory.</strong> Every byte sent to a third-party provider is logged (which provider, which call, which clip, which identity). Per-brand list of "providers this identity is allowed to be sent to" — supports brands whose contracts forbid certain vendors.</li>
+  <li><strong>Secrets.</strong> Per-provider API keys in a secrets manager (Doppler / 1Password / cloud-native), env-scoped, rotated. No <code>.env</code> files in repo. Webhook signing secrets versioned so rotation is non-disruptive.</li>
+  <li><strong>RBAC.</strong> Operators run batches and approve outputs. Only admins publish/retire identity versions or promote prompt versions. Every state-changing action writes to <code>operator_action</code>.</li>
+  <li><strong>Data retention.</strong> Identity versions have a configurable TTL; references are hard-deleted from R2 after retirement + grace period. Embeddings can be retained longer than reference images if the rights model requires it.</li>
+  <li><strong>Webhook security.</strong> HMAC verify with versioned secret, replay protection via <code>event_id</code> uniqueness + a <code>received_at</code> window, IP allow-list where the provider publishes one.</li>
+  <li><strong>Egress.</strong> Worker outbound network constrained to the provider domains. Catches a compromised dependency exfiltrating identity images.</li>
+</ul>
+
+<h2 id="rollout">11. Rollout plan</h2>
+
+<ol>
+  <li><strong>Phase 0 — feature flag everything.</strong> New batch flow lives behind a flag; current flow stays default. Schema migrations are additive and backward-compatible.</li>
+  <li><strong>Phase 1 — shadow mode.</strong> New batches run end-to-end but outputs are not published. Compare identity scores and operator-approval-equivalents against the manual baseline on real source pools. Tune thresholds.</li>
+  <li><strong>Phase 2 — tier-3 brands at 10%.</strong> Lowest-stakes brands route real batches through the new system. Quality + cost SLOs gate progression.</li>
+  <li><strong>Phase 3 — tier-3 100%, tier-2 progressively.</strong> Per-brand opt-in. Watch drift dashboards before broadening.</li>
+  <li><strong>Phase 4 — tier-1.</strong> Tier-1 stays on the "no fallback" policy (§3.1). Opt-in by brand, with a dry-run requirement.</li>
+</ol>
+<p>Rollback: the flag flips back to the legacy flow. All in-flight batches persist in Postgres and can resume (or be aborted by the operator) on either side of the flag. No destructive migrations.</p>
+
+<h2 id="qs">12. Three questions before owning this</h2>
+
+<ol>
+  <li><strong>What's the operator SLA — first-usable-output latency, and full-batch latency?</strong> This decides whether the queue parallelises aggressively (high concurrent credit burn, hot fallbacks, more identity-score variance) or runs a slower, cheaper serial chain with backpressure. The architecture branches hard on the answer.</li>
+  <li><strong>What's the legal / rights model for brand identity reference data — user-supplied photos, paid creator likenesses with usage windows, or AI-generated baselines?</strong> This dictates whether identity versions are retained indefinitely or auto-expire, whether cross-provider conditioning (uploading reference images / LoRA weights to a third-party motion provider) is permitted, and whether per-brand "no fallback" is a hard requirement or a tuning choice.</li>
+  <li><strong>When the primary image provider degrades, is "delayed but on-brand" or "on-time but slightly off-brand" the worse failure?</strong> Same question reframed: is this a throughput business or a per-output-quality business? The fallback chain policy, the surface-vs-skip default, and how aggressively we ship tier-1 brands onto the new flow all flip on this.</li>
+</ol>
+
+</body>
+</html>
