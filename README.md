@@ -8,6 +8,8 @@ Engineer-to-engineer design notes for the in-flight brand-identity-preserving sh
 
 A styled HTML version is included at [`AI_Content_Engine_SDD.html`](./AI_Content_Engine_SDD.html) — clone and open locally for the polished read.
 
+> **Recommended submission link:** [`TAKEHOME_SUBMISSION.md`](./TAKEHOME_SUBMISSION.md) is the tighter 1,500-word version aligned exactly to the four requested points. This README is the deeper appendix / architecture expansion.
+
 ---
 
 ## Contents
